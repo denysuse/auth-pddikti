@@ -14,7 +14,7 @@ Layanan ini dirancang khusus untuk memvalidasi keaktifan mahasiswa, mengambil id
 
 ## Persyaratan
 
-- Go 1.22 atau lebih baru
+- Go 1.27 atau lebih baru
 
 ## Menjalankan Layanan
 
@@ -123,3 +123,49 @@ curl -s "http://localhost:8090/api/detail/sample_encrypted_id_hash_value=="
 
 - Rate limit upstream PDDIKTI berada pada batas 60 request per menit per alamat IP publik.
 - Layanan ini diperuntukkan bagi verifikasi alur registrasi/autentikasi pengguna secara bertahap, bukan untuk penarikan data massal (bulk harvesting).
+
+
+## Catatan Fork (denysuse/auth-pddikti)
+
+Fork ini menerapkan perbaikan dari audit penuh tim kami atas repo asal
+(akbarhann/auth-pddikti, audit 8 Nov 2026, vonis: LAYAK DENGAN CATATAN).
+Repo asal tidak berlisensi; fork ini untuk pemakaian pribadi sambil
+menunggu izin tertulis dari pemilik repo asal.
+
+Perbaikan yang diterapkan:
+1. **Bug verifikasi salah orang diperbaiki.** Sebelumnya, bila NIM tidak
+   cocok persis, kode mengambil kandidat pertama hasil pencarian dan
+   mengembalikannya sebagai terverifikasi. Sekarang: tidak cocok persis =
+   tidak ditemukan (404).
+2. **Server hanya mendengarkan 127.0.0.1 secara bawaan.** Membuka ke
+   jaringan harus eksplisit: `HOST=0.0.0.0`, dan sangat dianjurkan bersama
+   `API_KEY`.
+3. **Kunci API opsional** lewat env `API_KEY`, diperiksa dari header
+   `X-API-Key` pada semua endpoint kecuali `/health`.
+4. **Batas laju lokal** 1 request/detik, jauh di bawah batas upstream
+   60 req/menit per IP.
+5. **CORS tidak lagi bintang.** Hanya origin yang didaftarkan lewat env
+   `ALLOWED_ORIGIN` (pisahkan koma) yang diizinkan.
+6. **Log tidak lagi mencatat NIM.** Logger bawaan yang mencatat path
+   lengkap diganti `gin.New()` + Recovery saja.
+7. **Validasi NIM**: hanya digit, panjang 5-25, sebelum diteruskan ke
+   upstream.
+8. **`/api/search` nonaktif secara bawaan** (risiko enumerasi data
+   pribadi). Aktifkan dengan `ENABLE_SEARCH=1` hanya bila perlu.
+9. **Pesan error ke pemanggil digeneralisasi**; detail internal/upstream
+   hanya masuk log server.
+10. **Dependensi dibersihkan** dengan `go mod tidy` (mongo-driver, quic-go,
+    protobuf yang tidak dipakai dibuang) dan syarat versi Go diselaraskan
+    dengan README.
+
+Contoh menjalankan dengan pengaman:
+
+```
+API_KEY=isi-kunci-sendiri ALLOWED_ORIGIN=http://localhost:3000 go run main.go
+```
+
+Peringatan pemakaian: data yang diambil adalah data pribadi mahasiswa.
+Gunakan hanya untuk memverifikasi orang yang mendaftar ke layananmu
+sendiri, dengan dasar pemrosesan yang sah menurut UU No. 27 Tahun 2022
+(Pelindungan Data Pribadi), tampilkan seminimal mungkin, dan jangan
+menyimpan hasil lookup.

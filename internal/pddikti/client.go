@@ -10,11 +10,18 @@ import (
 )
 
 const (
-	BaseURL   = "https://pddikti.kemdiktisaintek.go.id/api"
+	defaultBaseURL = "https://pddikti.kemdiktisaintek.go.id/api"
 	UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
 	Origin    = "https://pddikti.kemdiktisaintek.go.id"
 	Referer   = "https://pddikti.kemdiktisaintek.go.id/"
 )
+
+// upstreamBaseURL adalah alamat API PDDIKTI yang aktif. Variabel paket
+// (bukan konstanta) supaya pengujian bisa mengarahkan klien ke server uji
+// lokal; produksi selalu memakai defaultBaseURL.
+var upstreamBaseURL = defaultBaseURL
+
+func baseURL() string { return upstreamBaseURL }
 
 type Client struct {
 	httpClient *http.Client
@@ -90,7 +97,7 @@ func (c *Client) Search(keyword string) ([]StudentSearchResult, error) {
 	cleanKeyword = strings.ReplaceAll(cleanKeyword, "/", " ")
 	encoded := url.PathEscape(cleanKeyword)
 
-	endpoint := fmt.Sprintf("%s/pencarian/mhs/%s", BaseURL, encoded)
+	endpoint := fmt.Sprintf("%s/pencarian/mhs/%s", baseURL(), encoded)
 	req, err := c.prepareRequest(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -122,7 +129,7 @@ func (c *Client) Search(keyword string) ([]StudentSearchResult, error) {
 
 // GetDetail retrieves full student information using encrypted ID
 func (c *Client) GetDetail(id string) (*StudentDetail, error) {
-	endpoint := fmt.Sprintf("%s/detail/mhs/%s", BaseURL, url.PathEscape(id))
+	endpoint := fmt.Sprintf("%s/detail/mhs/%s", baseURL(), url.PathEscape(id))
 	req, err := c.prepareRequest(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -163,11 +170,11 @@ func (c *Client) VerifyNIM(nim string) (*StudentDetail, error) {
 	}
 
 	if targetID == "" {
-		if len(candidates) > 0 {
-			targetID = candidates[0].ID
-		} else {
-			return nil, fmt.Errorf("mahasiswa dengan NIM '%s' tidak ditemukan di PDDIKTI", nim)
-		}
+		// JANGAN mengambil kandidat pertama: hasil pencarian boleh berisi
+		// mahasiswa lain yang namanya mirip. Bila tidak ada NIM yang cocok
+		// persis, verifikasi GAGAL (tidak ditemukan), bukan "terverifikasi"
+		// atas data orang lain. (Perbaikan audit Lemper 8 Nov 2026)
+		return nil, fmt.Errorf("mahasiswa dengan NIM '%s' tidak ditemukan di PDDIKTI", nim)
 	}
 
 	return c.GetDetail(targetID)
