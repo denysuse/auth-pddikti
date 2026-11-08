@@ -2,6 +2,7 @@ package pddikti
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,42 +11,54 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://pddikti.kemdiktisaintek.go.id/api"
-	UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
-	Origin    = "https://pddikti.kemdiktisaintek.go.id"
-	Referer   = "https://pddikti.kemdiktisaintek.go.id/"
+	DefaultBaseURL = "https://pddikti.kemdiktisaintek.go.id/api"
+	DefaultTimeout = 8 * time.Second
+	UserAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+	Origin         = "https://pddikti.kemdiktisaintek.go.id"
+	Referer        = "https://pddikti.kemdiktisaintek.go.id/"
 )
 
-// upstreamBaseURL adalah alamat API PDDIKTI yang aktif. Variabel paket
-// (bukan konstanta) supaya pengujian bisa mengarahkan klien ke server uji
-// lokal; produksi selalu memakai defaultBaseURL.
-var upstreamBaseURL = defaultBaseURL
-
-func baseURL() string { return upstreamBaseURL }
-
 type Client struct {
+	baseURL    string
 	httpClient *http.Client
 }
 
-func NewClient(timeout time.Duration) *Client {
-	if timeout == 0 {
-		timeout = 8 * time.Second
+// Option configures a Client.
+type Option func(*Client)
+
+// WithBaseURL points the client at another upstream (used by tests).
+func WithBaseURL(u string) Option {
+	return func(c *Client) { c.baseURL = strings.TrimRight(u, "/") }
+}
+
+// WithTimeout sets the upstream HTTP timeout.
+func WithTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.httpClient.Timeout = d
+		}
 	}
-	return &Client{
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
+}
+
+func NewClient(opts ...Option) *Client {
+	c := &Client{
+		baseURL:    DefaultBaseURL,
+		httpClient: &http.Client{Timeout: DefaultTimeout},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // StudentSearchResult represents an item returned from /api/pencarian/mhs/{keyword}
 type StudentSearchResult struct {
-	ID         string `json:"id"`
-	Nama       string `json:"nama"`
-	NIM        string `json:"nim"`
-	NamaPT     string `json:"nama_pt"`
-	SingkatanPT string `json:"sinkatan_pt"`
-	NamaProdi  string `json:"nama_prodi"`
+	ID          string `json:"id"`
+	Nama        string `json:"nama"`
+	NIM         string `json:"nim"`
+	NamaPT      string `json:"nama_pt"`
+	SingkatanPT string `json:"sinkatan_pt"` // upstream spelling
+	NamaProdi   string `json:"nama_prodi"`
 }
 
 type SearchResponse struct {
@@ -72,110 +85,148 @@ type StudentDetail struct {
 	TanggalMasuk  string `json:"tanggal_masuk"`
 }
 
+// IsActive reports whether the current academic status is "Aktif-...".
+func (d *StudentDetail) IsActive() bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(d.StatusSaatIni)), "aktif")
+}
+
 type DetailResponse struct {
 	Status  string        `json:"status"`
 	Message string        `json:"message,omitempty"`
 	Data    StudentDetail `json:"data"`
 }
 
-func (c *Client) prepareRequest(endpoint string) (*http.Request, error) {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+// get performs a GET with browser-like headers, maps upstream failures to
+// sentinel errors and decodes a 200 response into out. badRequest is the
+// error returned for upstream 400/404 responses.
+func (c *Client) get(path string, out any, badRequest error) error {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Origin", Origin)
 	req.Header.Set("Referer", Referer)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	return req, nil
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		var uerr *url.Error
+		if errors.As(err, &uerr) && uerr.Timeout() {
+			return ErrTimeout
+		}
+		return fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusOK:
+	case resp.StatusCode == http.StatusForbidden:
+		return ErrBlocked
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return ErrRateLimited
+	case resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound:
+		return badRequest
+	default:
+		return fmt.Errorf("%w: status %d", ErrUpstream, resp.StatusCode)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%w: gagal decode JSON: %v", ErrUpstream, err)
+	}
+	return nil
 }
 
-// Search queries student by NIM or Name
+// Search queries students by NIM or name. An empty result is not an error.
 func (c *Client) Search(keyword string) ([]StudentSearchResult, error) {
-	cleanKeyword := strings.TrimSpace(keyword)
-	// Clean slashes to avoid routing errors
-	cleanKeyword = strings.ReplaceAll(cleanKeyword, "/", " ")
-	encoded := url.PathEscape(cleanKeyword)
+	clean := strings.TrimSpace(keyword)
+	// Slashes would change the upstream route.
+	clean = strings.ReplaceAll(clean, "/", " ")
 
-	endpoint := fmt.Sprintf("%s/pencarian/mhs/%s", baseURL(), encoded)
-	req, err := c.prepareRequest(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	var sr SearchResponse
+	// Upstream 400/404 on search means "no result", so it maps to a nil error.
+	if err := c.get("/pencarian/mhs/"+url.PathEscape(clean), &sr, nil); err != nil {
+		return nil, err
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http error reaching pddikti: %w", err)
+	if sr.Data == nil {
+		return []StudentSearchResult{}, nil
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("pddikti WAF challenge or missing headers (403 Forbidden)")
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("pddikti rate limit exceeded (60 req/min limit)")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pddikti returned status %d", resp.StatusCode)
-	}
-
-	var searchResp SearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	return searchResp.Data, nil
+	return sr.Data, nil
 }
 
-// GetDetail retrieves full student information using encrypted ID
+// GetDetail retrieves full student information using an encrypted ID.
 func (c *Client) GetDetail(id string) (*StudentDetail, error) {
-	endpoint := fmt.Sprintf("%s/detail/mhs/%s", baseURL(), url.PathEscape(id))
-	req, err := c.prepareRequest(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, ErrInvalidID
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http error: %w", err)
+	var dr DetailResponse
+	if err := c.get("/detail/mhs/"+url.PathEscape(id), &dr, ErrInvalidID); err != nil {
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("detail endpoint returned status %d", resp.StatusCode)
+	if strings.TrimSpace(dr.Data.ID) == "" && strings.TrimSpace(dr.Data.NIM) == "" {
+		return nil, ErrNotFound
 	}
-
-	var detailResp DetailResponse
-	if err := json.NewDecoder(resp.Body).Decode(&detailResp); err != nil {
-		return nil, fmt.Errorf("failed to decode detail response: %w", err)
-	}
-
-	return &detailResp.Data, nil
+	return &dr.Data, nil
 }
 
-// VerifyNIM searches by exact NIM and immediately pulls full student detail
-func (c *Client) VerifyNIM(nim string) (*StudentDetail, error) {
-	candidates, err := c.Search(nim)
+// VerifyNIM finds the student whose NIM matches nim exactly and returns the
+// full detail. It never falls back to a partial or fuzzy match.
+//
+// NIM is not unique nationwide: when several campuses share the same NIM,
+// campus (nama PT or singkatan, case-insensitive; empty = no filter) is used
+// to narrow it down, otherwise an *AmbiguousError is returned.
+func (c *Client) VerifyNIM(nim, campus string) (*StudentDetail, error) {
+	cleanNIM := strings.TrimSpace(nim)
+	if cleanNIM == "" {
+		return nil, ErrNotFound
+	}
+
+	candidates, err := c.Search(cleanNIM)
 	if err != nil {
 		return nil, err
 	}
 
-	cleanNIM := strings.TrimSpace(nim)
-	var targetID string
+	var matches []StudentSearchResult
 	for _, item := range candidates {
-		if strings.EqualFold(strings.TrimSpace(item.NIM), cleanNIM) {
-			targetID = item.ID
-			break
+		if strings.TrimSpace(item.NIM) == cleanNIM && matchesCampus(item, campus) {
+			matches = append(matches, item)
 		}
 	}
 
-	if targetID == "" {
-		// JANGAN mengambil kandidat pertama: hasil pencarian boleh berisi
-		// mahasiswa lain yang namanya mirip. Bila tidak ada NIM yang cocok
-		// persis, verifikasi GAGAL (tidak ditemukan), bukan "terverifikasi"
-		// atas data orang lain. (Perbaikan audit Lemper 8 Nov 2026)
-		return nil, fmt.Errorf("mahasiswa dengan NIM '%s' tidak ditemukan di PDDIKTI", nim)
+	switch len(matches) {
+	case 0:
+		return nil, ErrNotFound
+	case 1:
+	default:
+		amb := &AmbiguousError{NIM: cleanNIM}
+		for _, m := range matches {
+			amb.Candidates = append(amb.Candidates, Campus{
+				NamaPT:      strings.TrimSpace(m.NamaPT),
+				SingkatanPT: strings.TrimSpace(m.SingkatanPT),
+				NamaProdi:   strings.TrimSpace(m.NamaProdi),
+			})
+		}
+		return nil, amb
 	}
 
-	return c.GetDetail(targetID)
+	detail, err := c.GetDetail(matches[0].ID)
+	if err != nil {
+		return nil, err
+	}
+	// Defence in depth: the detail must belong to the NIM that was asked for.
+	if strings.TrimSpace(detail.NIM) != cleanNIM {
+		return nil, ErrNotFound
+	}
+	return detail, nil
+}
+
+func matchesCampus(item StudentSearchResult, campus string) bool {
+	campus = strings.ToUpper(strings.TrimSpace(campus))
+	if campus == "" {
+		return true
+	}
+	nama := strings.ToUpper(strings.TrimSpace(item.NamaPT))
+	singkatan := strings.ToUpper(strings.TrimSpace(item.SingkatanPT))
+	return (singkatan != "" && singkatan == campus) || strings.Contains(nama, campus)
 }
